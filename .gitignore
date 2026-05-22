@@ -1,0 +1,6 @@
+.datanexus/
+*.pyc
+__pycache__/
+.pytest_cache/
+*.log
+*.tmp
