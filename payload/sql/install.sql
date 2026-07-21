@@ -7,7 +7,8 @@
 --   2. Replaced generated stored topic regex column with a normal column.
 --   3. Replaced INCLUDE index with a simple index.
 --   4. Rewrote archive() writable CTEs into explicit transaction-scoped PL/pgSQL steps.
---   5. Added pgmq.version() for PluginCtl installed_probe.
+--   5. Replaced identity columns with BIGSERIAL for OpenTenBase CN/DN compatibility.
+--   6. Added pgmq.version() for PluginCtl installed_probe.
 ------------------------------------------------------------
 -- Schema, tables, records, privileges, indexes, etc
 ------------------------------------------------------------
@@ -334,33 +335,53 @@ RETURNS SETOF pgmq.message_record AS $$
 DECLARE
     sql TEXT;
     qtable TEXT := pgmq.format_table_name(queue_name, 'q');
+    selected_ids BIGINT[];
+    read_at TIMESTAMP WITH TIME ZONE := clock_timestamp();
+    next_vt TIMESTAMP WITH TIME ZONE := read_at + make_interval(secs => vt);
 BEGIN
     sql := FORMAT(
         $QUERY$
-        WITH cte AS
-        (
+        SELECT array_agg(msg_id ORDER BY msg_id)
+        FROM (
             SELECT msg_id
-            FROM pgmq.%I
-            WHERE vt <= clock_timestamp() AND CASE
-                WHEN %L != '{}'::jsonb THEN (message @> %2$L)::integer
-                ELSE 1
-            END = 1
+            FROM pgmq.%1$I
+            WHERE vt <= clock_timestamp()
+              AND ($2 = '{}'::jsonb OR message @> $2)
             ORDER BY msg_id ASC
             LIMIT $1
-            FOR UPDATE SKIP LOCKED
-        )
+        ) selected
+        $QUERY$,
+        qtable
+    );
+    EXECUTE sql USING qty, conditional INTO selected_ids;
+
+    IF selected_ids IS NULL OR array_length(selected_ids, 1) IS NULL THEN
+        RETURN;
+    END IF;
+
+    sql := FORMAT(
+        $QUERY$
         UPDATE pgmq.%I m
         SET
-            last_read_at = clock_timestamp(),
-            vt = clock_timestamp() + %L,
+            last_read_at = $2,
+            vt = $3,
             read_ct = read_ct + 1
-        FROM cte
-        WHERE m.msg_id = cte.msg_id
-        RETURNING m.msg_id, m.read_ct, m.enqueued_at, m.last_read_at, m.vt, m.message, m.headers;
+        WHERE m.msg_id = ANY($1);
         $QUERY$,
-        qtable, conditional, qtable, make_interval(secs => vt)
+        qtable
     );
-    RETURN QUERY EXECUTE sql USING qty;
+    EXECUTE sql USING selected_ids, read_at, next_vt;
+
+    sql := FORMAT(
+        $QUERY$
+        SELECT msg_id, read_ct, enqueued_at, last_read_at, vt, message, headers
+        FROM pgmq.%I
+        WHERE msg_id = ANY($1)
+        ORDER BY msg_id ASC;
+        $QUERY$,
+        qtable
+    );
+    RETURN QUERY EXECUTE sql USING selected_ids;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1168,7 +1189,7 @@ BEGIN
   EXECUTE FORMAT(
     $QUERY$
     CREATE TABLE IF NOT EXISTS pgmq.%I (
-        msg_id BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+        msg_id BIGSERIAL PRIMARY KEY,
         read_ct INT DEFAULT 0 NOT NULL,
         enqueued_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
         last_read_at TIMESTAMP WITH TIME ZONE,
@@ -1236,7 +1257,7 @@ BEGIN
   EXECUTE FORMAT(
     $QUERY$
     CREATE UNLOGGED TABLE IF NOT EXISTS pgmq.%I (
-        msg_id BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+        msg_id BIGSERIAL PRIMARY KEY,
         read_ct INT DEFAULT 0 NOT NULL,
         enqueued_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
         last_read_at TIMESTAMP WITH TIME ZONE,
@@ -1357,7 +1378,7 @@ BEGIN
   EXECUTE FORMAT(
     $QUERY$
     CREATE TABLE IF NOT EXISTS pgmq.%I (
-        msg_id BIGINT GENERATED ALWAYS AS IDENTITY,
+        msg_id BIGSERIAL,
         read_ct INT DEFAULT 0 NOT NULL,
         enqueued_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
         last_read_at TIMESTAMP WITH TIME ZONE,
